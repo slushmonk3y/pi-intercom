@@ -4,6 +4,9 @@
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
+  "piIntercom": {
+    "requiredPolicy": 1
+  },
   "bin": {
     "pi-intercom": "cli.mjs"
   },

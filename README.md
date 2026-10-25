@@ -540,6 +540,8 @@ A policy starts inactive; its owner calls `channel.policy.activate()` after its 
 
 A launch may require a policy with `PI_INTERCOM_REQUIRED_POLICY=<namespace>@<version>`. Until a matching policy is registered and active, and after it is disposed, inbound content is retained and sends and handover are refused; a malformed value keeps everything closed. Without the variable and without a policy, behavior is unchanged.
 
+`package.json` declares this contract as `"piIntercom": { "requiredPolicy": 1 }`, so a launcher can check an installed copy without loading it. The number names this version of the policy and required-policy contract.
+
 ### Extension outbox
 
 Same-process extensions can request a user-visible intercom send through the consent-aware outbox. Emit `intercom:outbox-request` with a unique `requestId`; listen for `intercom:outbox-result` and treat `sent`, `rejected`, `blocked`, and `failed` as terminal states. There is no fire-and-forget mode.
