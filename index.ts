@@ -17,7 +17,10 @@ import {
   INTERCOM_EXTENSION_REGISTRY_READY_EVENT,
   INTERCOM_OUTBOX_REQUEST_EVENT,
   INTERCOM_OUTBOX_RESULT_EVENT,
+  INTERCOM_REQUIRED_POLICY_ENV,
   INTERCOM_SESSION_IDENTITY_EVENT,
+  type IntercomDeliveryDecision,
+  type IntercomDeliveryEvent,
   type IntercomExtensionChannel,
   type IntercomExtensionEvent,
   type IntercomExtensionOwner,
@@ -27,6 +30,8 @@ import {
   type IntercomOutboxResultCode,
   type IntercomOutboxResultStatus,
   type IntercomOutboxResultV1,
+  type IntercomPolicyHandle,
+  type IntercomPolicyV1,
   type IntercomSessionIdentityRequestV1,
 } from "./extension-api.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
@@ -73,6 +78,52 @@ interface InboundMessageEntry {
   message: Message;
   replyCommand?: string;
   bodyText: string;
+  /** Recorded in the ReplyTracker only once admitted, so retained content never feeds reply inference. */
+  trackerDeferred?: boolean;
+}
+
+/** Bounded queue for inbound content a delivery policy retained; overflow is refused, never shifted out. */
+const RETAINED_INBOUND_MAX = 256;
+const POLICY_REASON_MAX = 200;
+const POLICY_DETAILS_MAX_BYTES = 4_096;
+const DELIVERED_ENTRY_KEYS = new Set(["from", "message", "replyCommand", "bodyText", "trackerDeferred"]);
+
+/** `namespace@version`; absent is undefined, anything else malformed fails closed. */
+function parseRequiredPolicy(raw: string | undefined): { namespace: string; version: number } | "invalid" | undefined {
+  if (raw === undefined) return undefined;
+  const match = /^([a-z][a-z0-9-]*)@([1-9][0-9]*)$/.exec(raw.trim());
+  return match ? { namespace: match[1]!, version: Number(match[2]) } : "invalid";
+}
+
+function boundedReason(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim().slice(0, POLICY_REASON_MAX) : undefined;
+}
+
+function isThenable(value: unknown): boolean {
+  return typeof (value as { then?: unknown } | null)?.then === "function";
+}
+
+/** Accept only a well-formed synchronous decision; anything else is treated as a failure. */
+function validDeliveryDecision(value: unknown): IntercomDeliveryDecision | undefined {
+  if (!value || typeof value !== "object" || isThenable(value)) return undefined;
+  const decision = value as Record<string, unknown>;
+  if (decision.action === "allow") {
+    if (decision.details === undefined) return { action: "allow" };
+    const details = decision.details;
+    if (!details || typeof details !== "object" || Array.isArray(details) || isThenable(details)) return undefined;
+    if (Object.keys(details).some((key) => DELIVERED_ENTRY_KEYS.has(key))) return undefined;
+    let size: number;
+    try { size = Buffer.byteLength(JSON.stringify(details), "utf8"); } catch { return undefined; }
+    return size <= POLICY_DETAILS_MAX_BYTES ? { action: "allow", details: details as Record<string, unknown> } : undefined;
+  }
+  const reason = boundedReason(decision.reason);
+  if ((decision.action === "retain" || decision.action === "deny") && reason) return { action: decision.action, reason };
+  return undefined;
+}
+
+function validPolicy(value: unknown): value is IntercomPolicyV1 {
+  const policy = value as Partial<IntercomPolicyV1> | null;
+  return Boolean(policy && typeof policy === "object" && policy.version === 1 && typeof policy.delivery === "function" && typeof policy.handover === "function");
 }
 
 interface DeliveryTarget {
@@ -719,6 +770,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   let agentRunning = false;
   const heldInboundMessages: InboundMessageEntry[] = [];
   let heldInboundTimer: NodeJS.Timeout | null = null;
+  // Delivery policy: the launch's requirement, the one registered owner, and content it retained.
+  const requiredPolicy = parseRequiredPolicy(process.env[INTERCOM_REQUIRED_POLICY_ENV]);
+  let policyOwner: { namespace: string; policy: IntercomPolicyV1; active: boolean; disposed: boolean } | null = null;
+  const retainedInbound: Array<{ entry: InboundMessageEntry; waiter: boolean }> = [];
+  let reevaluatingRetained = false;
+  let connectionGeneration = 0;
   function dropHeldInboundMessage(messageId: string, receipt: { status: MessageReceiptStatus; detail?: string }): boolean {
     const index = heldInboundMessages.findIndex((entry) => entry.message.id === messageId);
     if (index < 0) return false;
@@ -731,7 +788,104 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     for (const entry of heldInboundMessages.splice(0)) {
       emitMessageReceipt(entry.message.id, "expired", detail);
     }
+    for (const { entry } of retainedInbound.splice(0)) {
+      emitMessageReceipt(entry.message.id, "expired", detail);
+    }
     clearHeldInboundTimer();
+  }
+  function policyGate(): { open: true; policy?: IntercomPolicyV1 } | { open: false; reason: string } {
+    if (requiredPolicy === "invalid") return { open: false, reason: `${INTERCOM_REQUIRED_POLICY_ENV} is malformed` };
+    if (!policyOwner) {
+      return requiredPolicy
+        ? { open: false, reason: `required delivery policy ${requiredPolicy.namespace}@${requiredPolicy.version} is not registered` }
+        : { open: true };
+    }
+    if (requiredPolicy && (policyOwner.namespace !== requiredPolicy.namespace || policyOwner.policy.version !== requiredPolicy.version)) {
+      return { open: false, reason: "registered delivery policy does not match the required policy" };
+    }
+    if (policyOwner.disposed || !policyOwner.active) return { open: false, reason: "delivery policy is not active" };
+    return { open: true, policy: policyOwner.policy };
+  }
+  /** Fail closed: a closed gate, a throw or a malformed decision retains (inbound) or refuses (outbound). */
+  function decideDelivery(event: IntercomDeliveryEvent): IntercomDeliveryDecision {
+    const gate = policyGate();
+    if (!gate.open) return { action: "retain", reason: gate.reason };
+    if (!gate.policy) return { action: "allow" };
+    try {
+      return validDeliveryDecision(gate.policy.delivery(event)) ?? { action: "retain", reason: "delivery policy returned an invalid decision" };
+    } catch (error) {
+      return { action: "retain", reason: boundedReason(`delivery policy failed: ${getErrorMessage(error)}`)! };
+    }
+  }
+  /** Returns a refusal reason, or undefined when handover may proceed. */
+  function handoverRefusal(route: "tool" | "command" | "overlay", crossMachine: boolean): string | undefined {
+    const gate = policyGate();
+    if (!gate.open) return gate.reason;
+    if (!gate.policy) return undefined;
+    try {
+      const decision = gate.policy.handover({ version: 1, route, crossMachine }) as unknown as Record<string, unknown> | undefined;
+      if (!decision || typeof decision !== "object" || isThenable(decision)) return "handover policy returned an invalid decision";
+      if (decision.action === "allow") return undefined;
+      return decision.action === "deny" ? boundedReason(decision.reason) ?? "handover refused by policy" : "handover policy returned an invalid decision";
+    } catch (error) {
+      return boundedReason(`handover policy failed: ${getErrorMessage(error)}`)!;
+    }
+  }
+  function policyManaged(): boolean {
+    return requiredPolicy !== undefined || policyOwner !== null;
+  }
+  function inboundEvent(entry: InboundMessageEntry, route: "message" | "relay" | "reply-waiter"): IntercomDeliveryEvent {
+    return {
+      version: 1, direction: "inbound", route, messageId: entry.message.id,
+      from: { id: entry.from.id, ...(entry.from.name ? { name: entry.from.name } : {}) },
+      ...(entry.message.replyTo ? { replyTo: entry.message.replyTo } : {}),
+      ...(entry.message.expectsReply ? { expectsReply: true } : {}),
+      text: entry.bodyText,
+    };
+  }
+  function retainInbound(entry: InboundMessageEntry, waiter: boolean, reason: string): void {
+    if (retainedInbound.length >= RETAINED_INBOUND_MAX) {
+      emitMessageReceipt(entry.message.id, "expired", "refused: delivery policy retention is full");
+      return;
+    }
+    retainedInbound.push({ entry, waiter });
+    emitMessageReceipt(entry.message.id, "queued", `retained by delivery policy: ${reason}`);
+  }
+  /** Re-route retained content in order through the normal path; it is decided again at injection. */
+  function reevaluateRetainedInbound(): void {
+    const ctx = getLiveContext();
+    if (!ctx || reevaluatingRetained || retainedInbound.length === 0) return;
+    reevaluatingRetained = true;
+    try {
+      const generation = runtimeGeneration;
+      for (const { entry, waiter } of retainedInbound.splice(0)) {
+        if (waiter && resolveReplyWaiter(entry)) continue;
+        routeAcceptedInbound(entry, ctx, generation);
+      }
+    } finally {
+      reevaluatingRetained = false;
+    }
+  }
+  function createPolicyHandle(namespace: string, policy: IntercomPolicyV1): IntercomPolicyHandle {
+    const owner = { namespace, policy, active: false, disposed: false };
+    policyOwner = owner;
+    const current = () => policyOwner === owner && !owner.disposed;
+    return {
+      get active() { return current() && owner.active; },
+      activate() {
+        if (!current()) return;
+        owner.active = true;
+        reevaluateRetainedInbound();
+      },
+      deactivate() { if (current()) owner.active = false; },
+      dispose() {
+        owner.active = false;
+        owner.disposed = true;
+        // A launch requirement survives withdrawal; otherwise the session returns to unmanaged delivery.
+        if (policyOwner === owner && !requiredPolicy) policyOwner = null;
+      },
+      notify() { if (current() && owner.active) reevaluateRetainedInbound(); },
+    };
   }
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
@@ -915,9 +1069,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       // One local extension must not break intercom or other extension channels.
     }
   }
-  function createExtensionChannel(namespace: string): IntercomExtensionChannel {
+  function createExtensionChannel(namespace: string, policy?: IntercomPolicyHandle): IntercomExtensionChannel {
     return {
       namespace,
+      ...(policy ? { policy } : {}),
       snapshot() {
         const extension = localExtensions.get(namespace);
         return {
@@ -975,10 +1130,21 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (!/^[a-z0-9][a-z0-9._/-]{0,63}$/.test(registration.namespace)) {
       throw new Error(`Invalid intercom extension namespace: ${registration.namespace}`);
     }
-    if (localExtensions.has(registration.namespace)) {
+    const existing = localExtensions.get(registration.namespace);
+    if (existing) {
+      // Re-registering the same object returns the same channel and policy handle.
+      if (existing.registration === registration) {
+        registration.onReady(existing.channel);
+        return;
+      }
       throw new Error(`Intercom extension namespace already registered: ${registration.namespace}`);
     }
-    const channel = createExtensionChannel(registration.namespace);
+    if (registration.policy !== undefined) {
+      if (!validPolicy(registration.policy)) throw new Error(`Invalid intercom delivery policy: ${registration.namespace}`);
+      if (policyOwner && !policyOwner.disposed) throw new Error(`Intercom delivery policy is already owned by ${policyOwner.namespace}`);
+    }
+    const handle = registration.policy ? createPolicyHandle(registration.namespace, registration.policy) : undefined;
+    const channel = createExtensionChannel(registration.namespace, handle);
     localExtensions.set(registration.namespace, { registration, channel });
     const activeClient = client;
     const connected = Boolean(activeClient?.isConnected());
@@ -991,6 +1157,13 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     registration.onReady(channel);
     if (connected) {
       emitLocalExtensionEvent(registration.namespace, { type: "connection", connected: true, supported });
+      if (activeClient?.sessionId) {
+        emitLocalExtensionEvent(registration.namespace, {
+          type: "identity", sessionId: activeClient.sessionId,
+          ...(activeClient.endpointEpoch ? { endpointEpoch: activeClient.endpointEpoch } : {}),
+          connectionGeneration,
+        });
+      }
     }
   }
   function buildRegistration(): SessionRegistration {
@@ -1317,11 +1490,25 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       emitMessageReceipt(entry.message.id, "expired", "session context no longer active before injection");
       return;
     }
+    // The one delivery decision, made immediately before injection for every inbound route.
+    const decision = decideDelivery(inboundEvent(entry, entry.from.id.startsWith("subagent-") ? "relay" : "message"));
+    if (decision.action === "retain") {
+      retainInbound(entry, false, decision.reason);
+      return;
+    }
+    if (decision.action === "deny") {
+      emitMessageReceipt(entry.message.id, "expired", `refused by delivery policy: ${decision.reason}`);
+      return;
+    }
+    if (entry.trackerDeferred) {
+      replyTracker.recordIncomingMessage(entry.from, entry.message, entry.message.receiverReceivedAt ?? Date.now());
+    }
     const injectedMessage = { ...entry.message, injectedAt: Date.now() };
     const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
       ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
       : entry.replyCommand;
-    const deliveredEntry = { ...entry, message: injectedMessage, replyCommand };
+    const { trackerDeferred: _trackerDeferred, ...delivered } = entry;
+    const deliveredEntry = { ...delivered, message: injectedMessage, replyCommand, ...(decision.details ?? {}) };
     replyTracker.queueTurnContext({ from: entry.from, message: injectedMessage, receivedAt: Date.now() });
     const senderDisplay = injectedMessage.crossMachine
       ? `${relaySenderName(injectedMessage.crossMachine.origin)} · unverified cross-machine`
@@ -1417,17 +1604,6 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     const receivedMessage = { ...message, receiverReceivedAt };
     emitMessageReceipt(receivedMessage.id, "receiver_received");
-    if (replyWaiter) {
-      const senderTarget = from.name || from.id;
-      const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase()
-        || from.id === replyWaiter.from;
-      const replyMatches = receivedMessage.replyTo === replyWaiter.replyTo;
-      if (fromMatches && replyMatches) {
-        emitMessageReceipt(receivedMessage.id, "acknowledged", "matched reply waiter");
-        replyWaiter.resolve(receivedMessage);
-        return;
-      }
-    }
     const attachmentText = receivedMessage.content.attachments?.length
       ? formatAttachments(receivedMessage.content.attachments)
       : "";
@@ -1437,9 +1613,39 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       : config.replyHint && receivedMessage.expectsReply
         ? `intercom({ action: "reply", message: "..." })`
         : undefined;
-    replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
+    const entry: InboundMessageEntry = { from, message: receivedMessage, replyCommand, bodyText };
+    if (replyWaiterMatches(entry)) {
+      // A waiter is an in-band completion of this session's own ask, still decided by the policy.
+      const decision = decideDelivery(inboundEvent(entry, "reply-waiter"));
+      if (decision.action === "allow") {
+        resolveReplyWaiter(entry);
+        return;
+      }
+      if (decision.action === "retain") {
+        retainInbound(entry, true, decision.reason);
+        return;
+      }
+      emitMessageReceipt(receivedMessage.id, "expired", `refused by delivery policy: ${decision.reason}`);
+      return;
+    }
+    if (policyManaged()) entry.trackerDeferred = true;
+    else replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
     emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
-    const entry = { from, message: receivedMessage, replyCommand, bodyText };
+    routeAcceptedInbound(entry, liveContext, messageGeneration);
+  }
+  function replyWaiterMatches(entry: InboundMessageEntry): boolean {
+    if (!replyWaiter) return false;
+    const senderTarget = entry.from.name || entry.from.id;
+    const fromMatches = senderTarget.toLowerCase() === replyWaiter.from.toLowerCase() || entry.from.id === replyWaiter.from;
+    return fromMatches && entry.message.replyTo === replyWaiter.replyTo;
+  }
+  function resolveReplyWaiter(entry: InboundMessageEntry): boolean {
+    if (!replyWaiterMatches(entry)) return false;
+    emitMessageReceipt(entry.message.id, "acknowledged", "matched reply waiter");
+    replyWaiter!.resolve(entry.message);
+    return true;
+  }
+  function routeAcceptedInbound(entry: InboundMessageEntry, liveContext: ExtensionContext, messageGeneration: number): void {
     // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
     if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || (config.busyDelivery === "human-first" && liveContext.hasUI)))) {
       holdIncomingBrokerMessage(entry, liveContext, messageGeneration);
@@ -1448,6 +1654,18 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
   }
   function attachClientHandlers(nextClient: IntercomClient): void {
+    // Every send on this session's behalf, including automatic replies and relays, passes the policy.
+    nextClient.setSendGate((to, options, messageId) => {
+      const attachmentText = options.attachments?.length ? formatAttachments(options.attachments) : "";
+      const decision = decideDelivery({
+        version: 1, direction: "outbound", route: options.replyTo ? "reply" : options.expectsReply ? "ask" : "send", messageId,
+        ...(nextClient.sessionId ? { from: { id: nextClient.sessionId } } : {}), to,
+        ...(options.replyTo ? { replyTo: options.replyTo } : {}), ...(options.expectsReply ? { expectsReply: true } : {}),
+        text: `${options.text}${attachmentText}`,
+      });
+      if (decision.action === "allow") return undefined;
+      return { id: messageId, delivered: false, reason: `Refused by delivery policy: ${decision.reason}`, delivery: "failed", code: "E_POLICY_REFUSED", retryable: false, outcomeKnown: true };
+    });
     nextClient.onBrokerMessage((message: BrokerMessage) => {
       if (client !== nextClient) return;
       switch (message.type) {
@@ -1456,8 +1674,14 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           if (supported && localExtensions.size > 0) {
             nextClient.updateExtensionCapabilities(currentExtensionCapabilities());
           }
+          connectionGeneration += 1;
           for (const namespace of localExtensions.keys()) {
             emitLocalExtensionEvent(namespace, { type: "connection", connected: true, supported });
+            emitLocalExtensionEvent(namespace, {
+              type: "identity", sessionId: message.sessionId,
+              ...(message.endpointEpoch ? { endpointEpoch: message.endpointEpoch } : {}),
+              connectionGeneration,
+            });
           }
           break;
         }
@@ -1553,6 +1777,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     });
   }
   function markLocalExtensionsDisconnected(): void {
+    // Close admission locally first; the owner re-validates identity before activating again.
+    if (policyOwner) policyOwner.active = false;
     for (const [namespace, extension] of localExtensions) {
       extension.owner = undefined;
       emitLocalExtensionEvent(namespace, { type: "connection", connected: false, supported: false });
@@ -2043,6 +2269,8 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     disposed = false;
     runtimeStarted = true;
     runtimeGeneration += 1;
+    // A policy activation belongs to one runtime generation and conversation.
+    if (policyOwner) policyOwner.active = false;
     outboxRequestIds.clear();
     reconnectAttempt = 0;
     sessionHeldBlocked = false;
@@ -2810,6 +3038,13 @@ Usage:
               details: { error: true },
             };
           }
+          const handoverRefused = handoverRefusal("tool", Boolean(to?.includes("@")));
+          if (handoverRefused) {
+            return {
+              content: [{ type: "text", text: `Handover refused: ${handoverRefused}` }],
+              details: { error: true },
+            };
+          }
           let handoverText: string;
           try {
             handoverText = await buildHandoverText(connectedClient, ctx, { goal: message, crossMachine: Boolean(to?.includes("@")) }, _signal);
@@ -3216,10 +3451,16 @@ Usage:
     const goal = input.slice(target.length).trim() || undefined;
     const isPath = /^(\/|\.\.?\/|~(\/|$))/.test(target);
     const request = isPath ? { cwd: expandHomePath(target), openProjectPaneIfMissing: true } : { to: target };
-    await performHandover(liveContext, commandGeneration, request, { goal, crossMachine: !isPath && target.includes("@") });
+    await performHandover(liveContext, commandGeneration, request, { goal, crossMachine: !isPath && target.includes("@"), route: "command" });
   }
 
   async function openHandoverPicker(ctx: ExtensionContext, generation: number, preselectSessionId?: string): Promise<void> {
+    // Refuse before showing a picker that could only end in a vetoed handover.
+    const refused = handoverRefusal("overlay", false);
+    if (refused) {
+      notifyIfLive(ctx, `Handover refused: ${refused}`, "error", generation);
+      return;
+    }
     let pickerClient: IntercomClient;
     try {
       pickerClient = await ensureConnected("tool");
@@ -3257,11 +3498,11 @@ Usage:
 
     const { target, goal } = picked;
     if (target.kind === "local") {
-      await performHandover(ctx, generation, { to: target.session.id }, { goal, crossMachine: false });
+      await performHandover(ctx, generation, { to: target.session.id }, { goal, crossMachine: false, route: "overlay" });
       return;
     }
     if (target.kind === "remote") {
-      await performHandover(ctx, generation, { to: target.target }, { goal, crossMachine: true });
+      await performHandover(ctx, generation, { to: target.target }, { goal, crossMachine: true, route: "overlay" });
       return;
     }
     const path = (await ctx.ui.input("Project path for the new session", "~/dev/project"))?.trim();
@@ -3270,15 +3511,21 @@ Usage:
       notifyIfLive(ctx, "Handover cancelled", "info", generation);
       return;
     }
-    await performHandover(ctx, generation, { cwd: expandHomePath(path), openProjectPaneIfMissing: true }, { goal, crossMachine: false });
+    await performHandover(ctx, generation, { cwd: expandHomePath(path), openProjectPaneIfMissing: true }, { goal, crossMachine: false, route: "overlay" });
   }
 
   async function performHandover(
     ctx: ExtensionContext,
     generation: number,
     request: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing">,
-    options: { goal?: string; crossMachine: boolean },
+    options: { goal?: string; crossMachine: boolean; route: "command" | "overlay" },
   ): Promise<void> {
+    // The veto precedes connection, model generation, Git reads and any delayed send.
+    const refused = handoverRefusal(options.route, options.crossMachine);
+    if (refused) {
+      notifyIfLive(ctx, `Handover refused: ${refused}`, "error", generation);
+      return;
+    }
     let handoverClient: IntercomClient;
     try {
       handoverClient = await ensureConnected("tool");

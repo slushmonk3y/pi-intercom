@@ -413,11 +413,15 @@ test("opt-in TCP broker requires endpoint state for health and registration", { 
         lastActivity: Date.now(),
       },
     }, true);
-    assert.deepEqual(registerMessages, [{
+    assert.equal(registerMessages.length, 1);
+    const [registered] = registerMessages;
+    assert.match(String(registered.endpointEpoch), /^[0-9a-f-]{36}$/, "the broker reports the session's own endpoint epoch");
+    assert.deepEqual({ ...registered, endpointEpoch: undefined }, {
       type: "registered",
       sessionId: "authorized-tcp-client",
-      features: ["extension-bus-v1", "exact-send-v1"],
-    }]);
+      features: ["extension-bus-v1", "exact-send-v1", "self-identity-v1"],
+      endpointEpoch: undefined,
+    });
   } finally {
     if (broker.exitCode === null && broker.signalCode === null) {
       broker.kill("SIGTERM");
@@ -5726,5 +5730,189 @@ test("registered inline renderer follows real CustomMessageComponent rebuild and
       if (descriptor) Object.defineProperty(globalThis, key, descriptor);
       else Reflect.deleteProperty(globalThis, key);
     });
+  }
+});
+
+/* ------------------------------------------------------------ delivery policy */
+
+type PolicyHarness = { channel?: IntercomExtensionChannel; events: Array<{ type: string } & Record<string, unknown>> };
+
+function registerPolicy(harness: ReturnType<typeof createExtensionHarness>, policy: Record<string, unknown>, namespace = "policy-owner") {
+  const state: PolicyHarness = { events: [] };
+  const registration = {
+    namespace,
+    ownerEligible: false,
+    policy,
+    onReady: (channel: IntercomExtensionChannel) => { state.channel = channel; },
+    onEvent: (event: { type: string } & Record<string, unknown>) => state.events.push(event),
+  };
+  harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, registration);
+  return { state, registration };
+}
+
+async function withRequiredPolicy<T>(value: string | undefined, run: () => Promise<T>): Promise<T> {
+  const previous = process.env.PI_INTERCOM_REQUIRED_POLICY;
+  if (value === undefined) delete process.env.PI_INTERCOM_REQUIRED_POLICY; else process.env.PI_INTERCOM_REQUIRED_POLICY = value;
+  try { return await run(); } finally {
+    if (previous === undefined) delete process.env.PI_INTERCOM_REQUIRED_POLICY; else process.env.PI_INTERCOM_REQUIRED_POLICY = previous;
+  }
+}
+
+test("a required policy retains inbound content until it activates, then delivers with its correlation", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("policy-worker");
+  try {
+    await withRequiredPolicy("policy-owner@1", async () => { piIntercomExtension(harness.pi as never); });
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "policy-worker");
+    const decisions: string[] = [];
+    const { state } = registerPolicy(harness, {
+      version: 1,
+      handover: () => ({ action: "deny", reason: "managed" }),
+      delivery: (event: { direction: string; messageId: string }) => {
+        decisions.push(event.direction);
+        return { action: "allow", details: { binding: { activityId: `a-${event.messageId}` } } };
+      },
+    });
+    await planner.send("policy-worker", { text: "held until active" });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(harness.sentMessages, [], "nothing is injected while the required policy is inactive");
+    assert.deepEqual(decisions, [], "an inactive policy is not consulted");
+
+    state.channel!.policy!.activate();
+    assert.equal(harness.sentMessages.length, 1);
+    const [{ message }] = harness.sentMessages;
+    const details = message.details as { message: Message; binding?: { activityId: string } };
+    assert.equal(details.message.content.text, "held until active");
+    assert.deepEqual(details.binding, { activityId: `a-${details.message.id}` }, "the policy's correlation rides in the existing details");
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("retained content keeps its order, is re-decided on notify, and deny refuses without injection", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("retain-worker");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "retain-worker");
+    let held = true;
+    const { state } = registerPolicy(harness, {
+      version: 1,
+      handover: () => ({ action: "allow" }),
+      delivery: (event: { text: string }) => event.text.includes("forbidden") ? { action: "deny", reason: "not authorized" }
+        : held ? { action: "retain", reason: "hold" } : { action: "allow" },
+    });
+    state.channel!.policy!.activate();
+    for (const text of ["first", "forbidden", "second"]) await planner.send("retain-worker", { text });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(harness.sentMessages, []);
+    state.channel!.policy!.notify();
+    assert.deepEqual(harness.sentMessages, [], "notify while still held keeps everything retained");
+    held = false;
+    state.channel!.policy!.notify();
+    assert.deepEqual(harness.sentMessages.map(({ message }) => (message.details as { message: Message }).message.content.text), ["first", "second"]);
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("outbound sends and handover are decided by the policy before any transport or generation", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("outbound-worker");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(orchestrator, "outbound-worker");
+    const outbound: Array<{ route: string; to?: string }> = [];
+    const { state } = registerPolicy(harness, {
+      version: 1,
+      handover: () => ({ action: "deny", reason: "handover is unavailable in a managed session" }),
+      delivery: (event: { direction: string; route: string; to?: string }) => {
+        if (event.direction === "outbound") outbound.push({ route: event.route, to: event.to });
+        return event.direction === "outbound" ? { action: "deny", reason: "admission is closed by the active hold" } : { action: "allow" };
+      },
+    });
+    state.channel!.policy!.activate();
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+    const received = Promise.race([once(orchestrator, "message"), new Promise<null>((resolve) => setTimeout(() => resolve(null), 300))]);
+    const sent = await intercomTool.execute("refused-send", { action: "send", to: "orchestrator", message: "should not leave" }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(await received, null, "a refused send writes nothing to the broker");
+    assert.match(JSON.stringify(sent.content), /Refused by delivery policy: admission is closed by the active hold/);
+    assert.deepEqual(outbound, [{ route: "send", to: orchestrator.sessionId }], "decided on the resolved target before the write");
+    const handover = await intercomTool.execute("refused-handover", { action: "handover", to: "orchestrator", message: "goal" }, new AbortController().signal, undefined, harness.ctx);
+    assert.match(JSON.stringify(handover.content), /Handover refused: handover is unavailable in a managed session/);
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("throwing, thenable or malformed policy decisions fail closed", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("failclosed-worker");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "failclosed-worker");
+    let mode = "throw";
+    const { state } = registerPolicy(harness, {
+      version: 1,
+      handover: () => ({ action: "allow" }),
+      delivery: () => {
+        if (mode === "throw") throw new Error("policy bug");
+        if (mode === "thenable") return Promise.resolve({ action: "allow" });
+        if (mode === "malformed") return { action: "allow", details: { message: "overwrite" } };
+        return { action: "allow" };
+      },
+    });
+    state.channel!.policy!.activate();
+    for (const next of ["throw", "thenable", "malformed"]) {
+      mode = next;
+      await planner.send("failclosed-worker", { text: next });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(harness.sentMessages, [], "every failure retained the content instead of injecting it");
+    mode = "ok";
+    state.channel!.policy!.notify();
+    assert.deepEqual(harness.sentMessages.map(({ message }) => (message.details as { message: Message }).message.content.text), ["throw", "thenable", "malformed"]);
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("policy registration is idempotent for the same object, single-owner, and reports self identity", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("identity-worker");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const roster = await waitForSessionByName(planner, "identity-worker");
+    const policy = { version: 1, handover: () => ({ action: "allow" }), delivery: () => ({ action: "allow" }) };
+    const first = registerPolicy(harness, policy);
+    const handle = first.state.channel!.policy!;
+    let again: IntercomExtensionChannel | undefined;
+    assert.throws(() => harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, { ...first.registration, onReady: (value: IntercomExtensionChannel) => { again = value; } }), /already registered/);
+    assert.equal(again, undefined, "a different object for the same namespace is rejected");
+    first.registration.onReady = (value: IntercomExtensionChannel) => { again = value; };
+    harness.pi.events.emit(INTERCOM_EXTENSION_REGISTER_EVENT, first.registration);
+    assert.equal(again?.policy, handle, "the same registration object gets the same handle");
+    assert.throws(() => registerPolicy(harness, policy, "other-owner"), /already owned by policy-owner/, "a second policy owner is rejected");
+    const identity = first.state.events.find((event) => event.type === "identity");
+    assert.equal(identity?.sessionId, roster.id);
+    assert.equal(identity?.endpointEpoch, roster.endpointEpoch, "the session learns its own broker endpoint epoch");
+    assert.equal(handle.active, false, "a policy starts inactive");
+  } finally {
+    await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
   }
 });

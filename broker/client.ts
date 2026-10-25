@@ -77,6 +77,8 @@ export class IntercomClient extends EventEmitter {
   private socket: net.Socket | null = null;
   private _sessionId: string | null = null;
   private _features = new Set<string>();
+  private _endpointEpoch: string | null = null;
+  private sendGate: ((to: string, options: SendOptions, messageId: string) => SendResult | undefined) | null = null;
   private pendingSends = new Map<string, { resolve: (r: SendResult) => void; reject: (e: Error) => void }>();
   private pendingLists = new Map<string, { resolve: (sessions: SessionInfo[]) => void; reject: (e: Error) => void }>();
   private nextSenderSequence = 1;
@@ -98,6 +100,16 @@ export class IntercomClient extends EventEmitter {
 
   get sessionId(): string | null {
     return this._sessionId;
+  }
+
+  /** This connection's own broker endpoint epoch, when the broker reports it. */
+  get endpointEpoch(): string | null {
+    return this._endpointEpoch;
+  }
+
+  /** The owning runtime's delivery gate; a returned result refuses the send before any write. */
+  setSendGate(gate: ((to: string, options: SendOptions, messageId: string) => SendResult | undefined) | null): void {
+    this.sendGate = gate;
   }
 
   supportsFeature(feature: string): boolean {
@@ -235,6 +247,7 @@ export class IntercomClient extends EventEmitter {
         }
         this._sessionId = null;
         this._features.clear();
+        this._endpointEpoch = null;
         this.disconnectError = null;
         if (connectionEstablished && !wasDisconnecting) {
           this.emit("disconnected", disconnectError);
@@ -345,12 +358,18 @@ export class IntercomClient extends EventEmitter {
           throw new Error("Invalid registered features");
         }
 
+        if (brokerMessage.endpointEpoch !== undefined && (typeof brokerMessage.endpointEpoch !== "string" || brokerMessage.endpointEpoch.length === 0)) {
+          throw new Error("Invalid registered endpoint epoch");
+        }
+
         this._sessionId = brokerMessage.sessionId;
         this._features = new Set((brokerMessage.features as string[] | undefined) ?? []);
+        this._endpointEpoch = (brokerMessage.endpointEpoch as string | undefined) ?? null;
         const registered: BrokerMessage = {
           type: "registered",
           sessionId: brokerMessage.sessionId,
           ...(this._features.size > 0 ? { features: [...this._features] } : {}),
+          ...(this._endpointEpoch ? { endpointEpoch: this._endpointEpoch } : {}),
         };
         this.emit("broker_message", registered);
         this.emit("_registered", registered);
@@ -644,6 +663,8 @@ export class IntercomClient extends EventEmitter {
     }
     
     const messageId = options.messageId ?? randomUUID();
+    const refused = this.sendGate?.(to, options, messageId);
+    if (refused) return refused;
     const message: Message = {
       id: messageId,
       timestamp: Date.now(),

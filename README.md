@@ -532,6 +532,14 @@ The broker:
 
 `channel.publish()` accepts payloads up to 16 KiB. A `capable` broadcast includes the sender, so consumers must not blindly republish messages they receive. `channel.commitState()` uses compare-and-swap against the last observed revision. Capabilities registered after the broker connection is established are synchronized without reconnecting. Clients connected to an older broker see the channel as unsupported and do not send extension operations.
 
+### Delivery policy
+
+One registration per runtime may add a `policy` (`IntercomPolicyV1`): `delivery(event)` decides every route that exposes content to this session's model or sends on its behalf (inbound messages, local relays, reply waiters, and every outbound send including automatic replies), and `handover(event)` runs before handover generation, Git reads or any delayed send. Decisions are synchronous: `allow` (optionally with `details` merged into the delivered `intercom_message` details as correlation, never authority), `retain` (inbound content stays in Intercom's bounded queue and is decided again on `channel.policy.notify()`), or `deny`. Throwing, thenable or malformed results fail closed: inbound content is retained, sends and handover are refused. While a policy owns delivery, inbound content reaches the ReplyTracker only once admitted.
+
+A policy starts inactive; its owner calls `channel.policy.activate()` after its own readiness checks. Intercom closes admission locally on disconnect and on runtime replacement, so the owner must activate again. Re-registering the same registration object returns the same channel and handle; a second policy owner is rejected. Each registration also receives an `identity` event with this session's own broker `endpointEpoch` and a connection generation (`self-identity-v1`).
+
+A launch may require a policy with `PI_INTERCOM_REQUIRED_POLICY=<namespace>@<version>`. Until a matching policy is registered and active, and after it is disposed, inbound content is retained and sends and handover are refused; a malformed value keeps everything closed. Without the variable and without a policy, behavior is unchanged.
+
 ### Extension outbox
 
 Same-process extensions can request a user-visible intercom send through the consent-aware outbox. Emit `intercom:outbox-request` with a unique `requestId`; listen for `intercom:outbox-result` and treat `sent`, `rejected`, `blocked`, and `failed` as terminal states. There is no fire-and-forget mode.

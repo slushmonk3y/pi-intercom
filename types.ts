@@ -1,5 +1,7 @@
 export const EXTENSION_BUS_FEATURE = "extension-bus-v1";
 export const EXACT_SEND_FEATURE = "exact-send-v1";
+/** The broker tells each session its own endpoint epoch in `registered`. */
+export const SELF_IDENTITY_FEATURE = "self-identity-v1";
 /** Broker refused a register because another live process holds the session id. */
 export const SESSION_HELD_ERROR_CODE = "E_SESSION_HELD";
 
@@ -176,7 +178,7 @@ export type ClientMessage =
     };
 
 export type BrokerMessage =
-  | { type: "registered"; sessionId: string; features?: string[] }
+  | { type: "registered"; sessionId: string; features?: string[]; endpointEpoch?: string }
   | { type: "sessions"; requestId: string; sessions: SessionInfo[] }
   | { type: "message"; from: SessionInfo; message: Message }
   | { type: "presence_update"; session: SessionInfo }

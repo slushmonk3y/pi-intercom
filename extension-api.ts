@@ -5,6 +5,8 @@ export const INTERCOM_EXTENSION_REGISTRY_READY_EVENT = "intercom:extension-regis
 export const INTERCOM_OUTBOX_REQUEST_EVENT = "intercom:outbox-request";
 export const INTERCOM_OUTBOX_RESULT_EVENT = "intercom:outbox-result";
 export const INTERCOM_SESSION_IDENTITY_EVENT = "intercom:session-identity";
+/** `namespace@version` naming the delivery policy a managed launch requires before any admission. */
+export const INTERCOM_REQUIRED_POLICY_ENV = "PI_INTERCOM_REQUIRED_POLICY";
 
 /**
  * Emitted on the session's own event bus at session start, before the intercom
@@ -75,7 +77,9 @@ export type IntercomExtensionEvent =
   | { type: "state_result"; committed: boolean; revision: number; reason?: string }
   | { type: "session_joined"; session: SessionInfo }
   | { type: "session_left"; sessionId: string }
-  | { type: "presence_update"; session: SessionInfo };
+  | { type: "presence_update"; session: SessionInfo }
+  /** This session's own broker identity, sent after each registration. */
+  | { type: "identity"; sessionId: string; endpointEpoch?: string; connectionGeneration: number };
 
 export interface IntercomExtensionChannel {
   readonly namespace: string;
@@ -88,6 +92,64 @@ export interface IntercomExtensionChannel {
   publish(payload: unknown, options?: { audience?: "owner" | "capable"; ownerOnly?: boolean }): void;
   commitState(payload: unknown, expectedRevision?: number): void;
   listSessions(): Promise<SessionInfo[]>;
+  /** Present only when the registration supplied a policy. */
+  readonly policy?: IntercomPolicyHandle;
+}
+
+/**
+ * One delivery decision point for every route that exposes content to this session's model or
+ * sends on its behalf. Decisions are synchronous; throwing, malformed or thenable results fail
+ * closed (inbound: retain, outbound: deny).
+ */
+export interface IntercomDeliveryEvent {
+  version: 1;
+  direction: "inbound" | "outbound";
+  /** inbound: message | relay | reply-waiter; outbound: send | ask | reply */
+  route: "message" | "relay" | "reply-waiter" | "send" | "ask" | "reply";
+  messageId: string;
+  /** Inbound sender, or this session for outbound. */
+  from?: { id: string; name?: string };
+  /** Outbound target as requested. */
+  to?: string;
+  replyTo?: string;
+  expectsReply?: boolean;
+  /** Text the model would see (inbound) or that would be sent (outbound), attachments included. */
+  text: string;
+}
+
+export type IntercomDeliveryDecision =
+  /** `details` is merged into the delivered custom message's details: correlation only, never authority. */
+  | { action: "allow"; details?: Record<string, unknown> }
+  /** Inbound only: kept in Intercom's queue, re-decided on policy notification. Outbound treats it as deny. */
+  | { action: "retain"; reason: string }
+  | { action: "deny"; reason: string };
+
+export interface IntercomHandoverEvent {
+  version: 1;
+  route: "tool" | "command" | "overlay";
+  crossMachine: boolean;
+}
+
+export type IntercomHandoverDecision = { action: "allow" } | { action: "deny"; reason: string };
+
+export interface IntercomPolicyV1 {
+  version: 1;
+  /** Runs before handover generation, Git reads and any delayed send. */
+  handover(event: IntercomHandoverEvent): IntercomHandoverDecision;
+  delivery(event: IntercomDeliveryEvent): IntercomDeliveryDecision;
+}
+
+/**
+ * Owner control of a registered policy. A policy starts inactive: while it is inactive, or after
+ * dispose, inbound content is retained and handover and outbound sends are refused.
+ */
+export interface IntercomPolicyHandle {
+  readonly active: boolean;
+  activate(): void;
+  deactivate(): void;
+  dispose(): void;
+  /** Re-decide retained inbound content, for example after a hold is released. */
+  notify(): void;
 }
 
 export interface IntercomExtensionRegistration {
@@ -95,4 +157,6 @@ export interface IntercomExtensionRegistration {
   ownerEligible: boolean;
   onEvent(event: IntercomExtensionEvent): void;
   onReady(channel: IntercomExtensionChannel): void;
+  /** At most one registration per runtime may own a policy; re-registering the same object is idempotent. */
+  policy?: IntercomPolicyV1;
 }
