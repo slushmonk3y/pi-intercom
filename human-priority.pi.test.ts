@@ -102,6 +102,7 @@ async function startBroker(): Promise<ChildProcess> {
 interface PiWorker {
   session: AgentSessionInstance;
   modelInputs: ModelInput[];
+  notices: string[];
   releaseModel: () => void;
   modelCalls: () => number;
   waitForModelCall: (count: number) => Promise<void>;
@@ -110,7 +111,17 @@ interface PiWorker {
   shutdown: () => Promise<void>;
 }
 
-async function createPiWorker(name: string): Promise<PiWorker> {
+interface PiWorkerOptions {
+  cwd?: string;
+  projectTrusted?: boolean;
+  /** Prior session file entries (header first) to resume from. */
+  entries?: FileEntry[];
+}
+
+type FileEntry = NonNullable<Parameters<typeof SessionManager.inMemory>[2]>[number];
+
+async function createPiWorker(name: string, options: PiWorkerOptions = {}): Promise<PiWorker> {
+  const cwd = options.cwd ?? repoDir;
   const agentDir = mkdtempSync(path.join(sharedHomeDir, `agent-${name}-`));
   const faux = fauxProvider({ provider: `faux-${name}` });
   const modelRuntime = await ModelRuntime.create({ authPath: path.join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -118,6 +129,7 @@ async function createPiWorker(name: string): Promise<PiWorker> {
   const model = faux.getModel();
 
   const modelInputs: ModelInput[] = [];
+  const notices: string[] = [];
   const releases: Array<() => void> = [];
   let modelCallCount = 0;
   let settledCount = 0;
@@ -135,7 +147,7 @@ async function createPiWorker(name: string): Promise<PiWorker> {
   }));
 
   const loader = new DefaultResourceLoader({
-    cwd: repoDir,
+    cwd,
     agentDir,
     noExtensions: true,
     noSkills: true,
@@ -155,21 +167,25 @@ async function createPiWorker(name: string): Promise<PiWorker> {
   await loader.reload();
 
   const { session } = await createAgentSession({
-    cwd: repoDir,
+    cwd,
     agentDir,
     model,
     thinkingLevel: "off",
     modelRuntime,
     resourceLoader: loader,
     noTools: "builtin",
-    sessionManager: SessionManager.inMemory(repoDir),
-    settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } }),
+    sessionManager: SessionManager.inMemory(cwd, undefined, options.entries),
+    settingsManager: SettingsManager.inMemory(
+      { compaction: { enabled: false }, retry: { enabled: false } },
+      { projectTrusted: options.projectTrusted ?? true },
+    ),
+    ...(options.entries ? { sessionStartEvent: { type: "session_start", reason: "resume" } as const } : {}),
   });
   await session.bindExtensions({
     mode: "tui",
     uiContext: {
       ...(session.extensionRunner.getUIContext()),
-      notify: () => undefined,
+      notify: (message: string, level?: string) => { notices.push(`${level ?? "info"}: ${message}`); },
     },
   });
   session.setSessionName(name);
@@ -177,6 +193,7 @@ async function createPiWorker(name: string): Promise<PiWorker> {
   return {
     session,
     modelInputs,
+    notices,
     releaseModel: () => {
       const release = releases.shift();
       if (!release) throw new Error("No blocked model call to release");
@@ -198,7 +215,7 @@ async function createPiWorker(name: string): Promise<PiWorker> {
 
 interface Fixture {
   planner: InstanceType<typeof IntercomClient>;
-  createWorker: (name: string) => Promise<PiWorker>;
+  createWorker: (name: string, options?: PiWorkerOptions) => Promise<PiWorker>;
   receipts: Map<string, string[]>;
   waitForReceipt: (messageId: string, status: string) => Promise<void>;
   waitForSession: (name: string) => Promise<SessionInfo>;
@@ -223,9 +240,9 @@ async function setupFixture(): Promise<Fixture> {
   });
   return {
     planner,
-    createWorker: async (name) => {
+    createWorker: async (name, options) => {
       try {
-        return await createPiWorker(name);
+        return await createPiWorker(name, options);
       } catch (error) {
         await planner.disconnect().catch(() => undefined);
         broker.kill("SIGTERM");
@@ -485,5 +502,127 @@ test("held peers expire on session shutdown instead of being injected later", { 
   } finally {
     worker.session.dispose();
     await fixture.cleanup();
+  }
+});
+
+function projectDir(intercomJson?: string): string {
+  const dir = mkdtempSync(path.join(sharedHomeDir, "project-"));
+  if (intercomJson !== undefined) {
+    mkdirSync(path.join(dir, ".agents"), { recursive: true });
+    writeFileSync(path.join(dir, ".agents", "intercom.json"), intercomJson);
+  }
+  return dir;
+}
+
+async function lastNotice(worker: PiWorker, command: string): Promise<string | undefined> {
+  const before = worker.notices.length;
+  await worker.session.prompt(command);
+  return worker.notices.length > before ? worker.notices.at(-1) : undefined;
+}
+
+test("delivery commands show, set, reject and reset the session layer over project and global", { concurrency: false }, async () => {
+  const fixture = await setupFixture();
+  const worker = await fixture.createWorker("delivery-commands", { cwd: projectDir(JSON.stringify({ inboundTrigger: "replies" })) });
+  try {
+    assert.equal(await lastNotice(worker, "/intercom-trigger"), "info: Intercom inboundTrigger: replies (project)");
+    assert.equal(await lastNotice(worker, "/intercom-busy"), "info: Intercom busyDelivery: human-first (global)");
+    assert.equal(await lastNotice(worker, "/intercom-trigger never"), "info: Intercom inboundTrigger: never (session)");
+    assert.equal(await lastNotice(worker, "/intercom-busy steer"), "info: Intercom busyDelivery: steer (session)");
+    assert.equal(
+      await lastNotice(worker, "/intercom-trigger sometimes"),
+      "warning: Usage: /intercom-trigger [always|replies|never|reset]",
+    );
+    assert.equal(await lastNotice(worker, "/intercom-trigger"), "info: Intercom inboundTrigger: never (session)");
+    assert.equal(await lastNotice(worker, "/intercom-trigger reset"), "info: Intercom inboundTrigger: replies (project)");
+    assert.equal(await lastNotice(worker, "/intercom-busy reset"), "info: Intercom busyDelivery: human-first (global)");
+    assert.equal(worker.modelCalls(), 0, "commands never reach the model");
+  } finally {
+    await worker.shutdown().finally(() => fixture.cleanup());
+  }
+});
+
+test("an untrusted project's .agents/intercom.json is ignored", { concurrency: false }, async () => {
+  const fixture = await setupFixture();
+  const worker = await fixture.createWorker("delivery-untrusted", {
+    cwd: projectDir(JSON.stringify({ inboundTrigger: "never" })),
+    projectTrusted: false,
+  });
+  try {
+    assert.equal(await lastNotice(worker, "/intercom-trigger"), "info: Intercom inboundTrigger: always (default)");
+  } finally {
+    await worker.shutdown().finally(() => fixture.cleanup());
+  }
+});
+
+test("an invalid project value warns at session start and fails closed", { concurrency: false }, async () => {
+  const fixture = await setupFixture();
+  const cwd = projectDir(JSON.stringify({ inboundTrigger: "sometimes" }));
+  const worker = await fixture.createWorker("delivery-invalid", { cwd });
+  try {
+    assert.ok(
+      worker.notices.includes(`warning: ${path.join(cwd, ".agents", "intercom.json")}: "inboundTrigger" must be "always", "replies", or "never"; using "never"`),
+      `expected a startup warning, got ${JSON.stringify(worker.notices)}`,
+    );
+    assert.equal(await lastNotice(worker, "/intercom-trigger"), "info: Intercom inboundTrigger: never (project)");
+  } finally {
+    await worker.shutdown().finally(() => fixture.cleanup());
+  }
+});
+
+test("the environment layer sits between project and session", { concurrency: false }, async () => {
+  const fixture = await setupFixture();
+  process.env.PI_INTERCOM_INBOUND_TRIGGER = "never";
+  const worker = await fixture.createWorker("delivery-env", { cwd: projectDir(JSON.stringify({ inboundTrigger: "replies" })) });
+  try {
+    assert.equal(await lastNotice(worker, "/intercom-trigger"), "info: Intercom inboundTrigger: never (env)");
+    assert.equal(await lastNotice(worker, "/intercom-trigger always"), "info: Intercom inboundTrigger: always (session)");
+    assert.equal(await lastNotice(worker, "/intercom-trigger reset"), "info: Intercom inboundTrigger: never (env)");
+  } finally {
+    delete process.env.PI_INTERCOM_INBOUND_TRIGGER;
+    await worker.shutdown().finally(() => fixture.cleanup());
+  }
+});
+
+test("session delivery settings are restored from the branch on resume", { concurrency: false }, async () => {
+  const fixture = await setupFixture();
+  const cwd = projectDir();
+  const first = await fixture.createWorker("delivery-before-resume", { cwd });
+  let entries: FileEntry[];
+  try {
+    await first.session.prompt("/intercom-busy steer");
+    await first.session.prompt("/intercom-trigger never");
+    await first.session.prompt("/intercom-trigger reset");
+    const sessionManager = first.session.sessionManager;
+    entries = [sessionManager.getHeader()!, ...sessionManager.getEntries()];
+  } finally {
+    await first.shutdown();
+  }
+  const resumed = await fixture.createWorker("delivery-after-resume", { cwd, entries });
+  try {
+    assert.equal(await lastNotice(resumed, "/intercom-busy"), "info: Intercom busyDelivery: steer (session)");
+    assert.equal(await lastNotice(resumed, "/intercom-trigger"), "info: Intercom inboundTrigger: always (default)");
+  } finally {
+    await resumed.shutdown().finally(() => fixture.cleanup());
+  }
+});
+
+test("a session inboundTrigger of never keeps a peer message from starting a turn", { concurrency: false }, async () => {
+  const fixture = await setupFixture();
+  const worker = await fixture.createWorker("delivery-never");
+  try {
+    const target = await fixture.waitForSession("delivery-never");
+    await worker.session.prompt("/intercom-trigger never");
+    assert.equal((await fixture.planner.send(target.id, { messageId: "quiet-peer", text: "quiet peer" })).delivered, true);
+    await fixture.waitForReceipt("quiet-peer", "injected");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(worker.modelCalls(), 0, "never must not start a turn");
+
+    await worker.session.prompt("/intercom-trigger reset");
+    assert.equal((await fixture.planner.send(target.id, { messageId: "loud-peer", text: "loud peer" })).delivered, true);
+    await worker.waitForModelCall(1);
+    worker.releaseModel();
+    await worker.waitForSettled(1);
+  } finally {
+    await worker.shutdown().finally(() => fixture.cleanup());
   }
 });

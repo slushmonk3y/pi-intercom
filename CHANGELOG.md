@@ -4,6 +4,12 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- `inboundTrigger` and `busyDelivery` can be set for one project in `.agents/intercom.json`, at launch with `PI_INTERCOM_INBOUND_TRIGGER` and `PI_INTERCOM_BUSY_DELIVERY`, or for one session with the new `/intercom-trigger` and `/intercom-busy` commands. A session's choice survives `/resume` and forks. With no argument, each command shows the current value and where it came from.
+
+### Changed
+- An invalid `inboundTrigger` or `busyDelivery` no longer stops pi-intercom from loading. It is reported when the session starts; an invalid `inboundTrigger` uses `"never"` and an invalid `busyDelivery` is ignored. Other invalid `config.json` values still stop it loading, and the README now says so instead of claiming every invalid value fails closed.
+
 ## [0.18.1] - 2026-10-22
 
 ### Changed

@@ -473,8 +473,31 @@ Create `~/.pi/agent/intercom/config.json`:
 | `crossMachine.machineName` | lowercased short hostname | Name peers use for this host in their Herdr saved-machine lists |
 | `crossMachine.remoteCommand` | `"pi-intercom"` | Command invoked through non-interactive SSH on remote machines |
 
-If `config.json` cannot be parsed or contains an invalid value, pi-intercom logs the error and fails closed for inbound broker auto-triggering by using `inboundTrigger: "never"` until the config is fixed.
+If `config.json` cannot be parsed, or any key other than `inboundTrigger` and `busyDelivery` has an invalid value, pi-intercom does not load and Pi reports `Failed to load extension`. An invalid `inboundTrigger` or `busyDelivery` does not stop it loading; see [Per-project and per-session delivery](#per-project-and-per-session-delivery).
 Obsolete `toolVisibility` values are ignored; the generic `intercom` tool remains stable in the active tool set for prompt-cache friendliness.
+
+### Per-project and per-session delivery
+
+`inboundTrigger` and `busyDelivery` can also be set for one project or one session. Each value comes from the highest of these layers that sets it:
+
+1. built-in defaults (`"always"`, `"steer"`);
+2. `config.json` above;
+3. the project file `.agents/intercom.json` in the folder Pi starts in (only that folder, not its parents);
+4. the launch environment variables `PI_INTERCOM_INBOUND_TRIGGER` and `PI_INTERCOM_BUSY_DELIVERY`;
+5. the session commands `/intercom-trigger` and `/intercom-busy`.
+
+```json
+{
+  "inboundTrigger": "replies",
+  "busyDelivery": "human-first"
+}
+```
+
+The project file reads only these two keys. Pi skips it when the project is not trusted, for example with `pi --no-approve`. Pi does not ask about trust for this file alone, so a project file can loosen your global setting as well as tighten it, for example turning `"never"` back into `"always"`. Treat `.agents/intercom.json` in a repository you did not write the way you would treat its other agent configuration.
+
+`/intercom-trigger always|replies|never` and `/intercom-busy steer|human-first` change the value for the current session. The choice is saved in the session, so `/resume` and forks keep it. `reset` removes the session's choice and the value falls back to the layer below. With no argument, each command shows the current value and the layer it came from, for example `Intercom inboundTrigger: replies (project)`.
+
+An invalid value in `config.json`, the project file or an environment variable is reported once when the session starts, naming the file or variable. An invalid `inboundTrigger` fails closed to `"never"`, so messages still arrive but do not start turns on their own. An invalid `busyDelivery` is ignored and the layer below applies. A project file that is not a valid JSON object counts as invalid for both keys. A higher layer still overrides an invalid one. A command with an invalid argument is refused and changes nothing.
 
 Custom broker commands are trusted local configuration: anyone who can edit this config can choose the executable used for future broker auto-spawns. For example, if you have Bun installed and want it to start the broker directly, use:
 
@@ -665,7 +688,7 @@ Runtime files live at `~/.pi/agent/intercom/` by default, or `$PI_CODING_AGENT_D
 - `broker.port.json` — Dynamic localhost TCP endpoint, only when Windows TCP transport is explicitly enabled
 - `config.json` — User configuration
 
-Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `busyDelivery` (`steer` or `human-first`), `replyHint`, `confirmSend`, and advanced broker launch overrides.
+Supported `config.json` keys include `stableId` for restart-stable addressing, `status` for a custom status suffix, `inboundTrigger` (`always`, `replies`, or `never`), `busyDelivery` (`steer` or `human-first`), `replyHint`, `confirmSend`, and advanced broker launch overrides. `inboundTrigger` and `busyDelivery` can also be set per project in `.agents/intercom.json`.
 
 ## Design Decisions
 

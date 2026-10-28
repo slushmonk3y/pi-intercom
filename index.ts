@@ -9,7 +9,20 @@ import { SessionListOverlay, type SessionListSelection } from "./ui/session-list
 import { HandoverPicker, type HandoverPickerResult, type RemoteSessionLister } from "./ui/handover-picker.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
-import { getAskTimeoutMs, getIntercomScopeId, loadConfig, setIntercomScopeId, type IntercomConfig } from "./config.ts";
+import {
+  getAskTimeoutMs,
+  getIntercomScopeId,
+  isBusyDeliveryPolicy,
+  isInboundTriggerPolicy,
+  loadConfig,
+  readEnvDeliveryLayer,
+  readProjectDeliveryLayer,
+  resolveDeliverySettings,
+  setIntercomScopeId,
+  type DeliveryLayerInput,
+  type DeliverySettings,
+  type IntercomConfig,
+} from "./config.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
@@ -50,6 +63,7 @@ const INTERCOM_TOOL_NAME = "intercom";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
+const DELIVERY_SETTINGS_ENTRY = "intercom_delivery_settings";
 const INBOUND_MESSAGE_DEDUPE_MAX = 1000;
 const INBOUND_MESSAGE_DEDUPE_RETENTION_MS = 60 * 60 * 1000;
 const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX = "subagent-chat";
@@ -740,6 +754,12 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   const wakeWithTriggerTurn = triggerTurnRunsPromptLifecycle(piVersion);
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
+  // inboundTrigger and busyDelivery layer config.json, .agents/intercom.json, the launch
+  // environment and this session's commands; re-resolved at every session_start.
+  let projectDeliveryLayer: DeliveryLayerInput | undefined;
+  let envDeliveryLayer = readEnvDeliveryLayer();
+  let sessionDeliveryValues: DeliveryLayerInput["values"] = {};
+  let delivery: DeliverySettings = resolveDelivery();
   const localExtensions = new Map<string, {
     registration: IntercomExtensionRegistration;
     channel: IntercomExtensionChannel;
@@ -1052,6 +1072,46 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       return;
     }
     notifyIfLive(liveContext, message, level, generation);
+  }
+  function resolveDelivery(): DeliverySettings {
+    return resolveDeliverySettings({
+      global: config.delivery,
+      project: projectDeliveryLayer,
+      env: envDeliveryLayer,
+      session: { origin: "session", values: sessionDeliveryValues },
+    });
+  }
+  function restoreDeliverySettings(ctx: ExtensionContext): void {
+    projectDeliveryLayer = ctx.isProjectTrusted() ? readProjectDeliveryLayer(ctx.cwd) : undefined;
+    envDeliveryLayer = readEnvDeliveryLayer();
+    const saved = ctx.sessionManager.getBranch()
+      .findLast((entry) => entry.type === "custom" && entry.customType === DELIVERY_SETTINGS_ENTRY);
+    const data = saved?.type === "custom" ? saved.data : undefined;
+    sessionDeliveryValues = data && typeof data === "object" && !Array.isArray(data)
+      ? { inboundTrigger: (data as Record<string, unknown>).inboundTrigger, busyDelivery: (data as Record<string, unknown>).busyDelivery }
+      : {};
+    delivery = resolveDelivery();
+    for (const warning of delivery.warnings) {
+      if (ctx.hasUI) ctx.ui.notify(warning, "warning");
+      else console.error(warning);
+    }
+  }
+  function runDeliveryCommand(key: "inboundTrigger" | "busyDelivery", usage: string, args: string, ctx: ExtensionContext): void {
+    const requested = args.trim();
+    if (requested) {
+      const valid = key === "inboundTrigger" ? isInboundTriggerPolicy(requested) : isBusyDeliveryPolicy(requested);
+      if (requested !== "reset" && !valid) {
+        notifyCommand(ctx, `Usage: ${usage}`, "warning");
+        return;
+      }
+      const next = { ...sessionDeliveryValues };
+      if (requested === "reset") delete next[key];
+      else next[key] = requested;
+      sessionDeliveryValues = next;
+      pi.appendEntry(DELIVERY_SETTINGS_ENTRY, next);
+      delivery = resolveDelivery();
+    }
+    notifyCommand(ctx, `Intercom ${key}: ${delivery[key]} (${delivery.sources[key]})`, "info");
   }
   function getReconnectDelayMs(): number {
     const backoffMs = [1000, 2000, 5000, 10000, 30000];
@@ -1477,10 +1537,10 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     if (forceTrigger) {
       return true;
     }
-    if (config.inboundTrigger === "always") {
+    if (delivery.inboundTrigger === "always") {
       return true;
     }
-    if (config.inboundTrigger === "replies") {
+    if (delivery.inboundTrigger === "replies") {
       return Boolean(entry.message.replyTo);
     }
     return false;
@@ -1566,7 +1626,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   }
   function flushHeldInboundMessages(ctx: ExtensionContext, generation: number): void {
     if (!getLiveContext(ctx, generation)) return;
-    if (config.busyDelivery === "human-first" && ctx.hasUI) {
+    if (delivery.busyDelivery === "human-first" && ctx.hasUI) {
       if (ctx.isIdle() && !isIdleWakePending(ctx.sessionManager) && heldInboundMessages.length > 0) {
         deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
       }
@@ -1647,7 +1707,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   }
   function routeAcceptedInbound(entry: InboundMessageEntry, liveContext: ExtensionContext, messageGeneration: number): void {
     // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
-    if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || (config.busyDelivery === "human-first" && liveContext.hasUI)))) {
+    if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || (delivery.busyDelivery === "human-first" && liveContext.hasUI)))) {
       holdIncomingBrokerMessage(entry, liveContext, messageGeneration);
     } else {
       deliverIncomingBrokerMessage(entry, liveContext, messageGeneration);
@@ -2416,6 +2476,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
   });
   const unsubscribeOutboxRequest = pi.events.on(INTERCOM_OUTBOX_REQUEST_EVENT, handleOutboxRequest);
   pi.on("session_start", (_event, ctx) => {
+    restoreDeliverySettings(ctx);
     if (!config.enabled) {
       return;
     }
@@ -2455,7 +2516,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     }
     replyTracker.endTurn();
     // Aborted/error turns cannot consume a steer; leave their peers for the idle trigger.
-    if (config.busyDelivery === "human-first" && ctx.hasUI && event.message.role === "assistant"
+    if (delivery.busyDelivery === "human-first" && ctx.hasUI && event.message.role === "assistant"
       && event.message.stopReason !== "aborted" && event.message.stopReason !== "error"
       && heldInboundMessages.length > 0 && agentRunning
       && !ctx.isIdle() && !ctx.hasPendingMessages() && getLiveContext(ctx)) {
@@ -3659,6 +3720,16 @@ Usage:
   pi.registerCommand("intercom-pool", {
     description: "Show or switch this session's intercom pool (usage: /intercom-pool, /intercom-pool <name>, or /intercom-pool default)",
     handler: async (args, ctx) => runIntercomPoolCommand(args, ctx),
+  });
+
+  pi.registerCommand("intercom-trigger", {
+    description: "Show or set whether inbound intercom messages start a turn in this session (usage: /intercom-trigger [always|replies|never|reset])",
+    handler: async (args, ctx) => runDeliveryCommand("inboundTrigger", "/intercom-trigger [always|replies|never|reset]", args, ctx),
+  });
+
+  pi.registerCommand("intercom-busy", {
+    description: "Show or set how peer messages arriving during a run are delivered in this session (usage: /intercom-busy [steer|human-first|reset])",
+    handler: async (args, ctx) => runDeliveryCommand("busyDelivery", "/intercom-busy [steer|human-first|reset]", args, ctx),
   });
 
   pi.registerCommand("alias", {
