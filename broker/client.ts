@@ -13,6 +13,7 @@ import type {
   ClientMessage,
   Message,
   MessageControl,
+  MessageOrigin,
   MessageProvenance,
   MessageReceipt,
   SessionInfo,
@@ -30,6 +31,7 @@ interface SendOptions {
   retryOf?: string;
   provenance?: MessageProvenance;
   crossMachine?: CrossMachineProvenance;
+  origin?: MessageOrigin;
 }
 
 export interface SendResult extends DeliveryDetails {
@@ -675,6 +677,7 @@ export class IntercomClient extends EventEmitter {
       expectsReply: options.expectsReply,
       provenance: options.provenance,
       crossMachine: options.crossMachine,
+      ...(options.origin ? { origin: options.origin } : {}),
       content: {
         text: options.text,
         attachments: options.attachments,

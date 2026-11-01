@@ -5,6 +5,7 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 ## [Unreleased]
 
 ### Added
+- Messages can carry an optional `origin`: the sending harness and whether a person (`human`), a model's tool call (`agent`) or code (`extension`) wrote it. Receivers show it after the sender's directory, as `**From boss** (~/x) · human via claude-code`, in the posted text and the inline header; a message without one looks as before. Pi marks its own sends (see README "Message origin"), and the CLI's `send` and `ask` take `--origin <kind> --harness <id>`. A malformed `origin` is rejected as `E_INVALID_MESSAGE`, and `origin` is part of the replay fingerprint. The broker does not verify it.
 - `inboundTrigger` and `busyDelivery` can be set for one project in `.agents/intercom.json`, at launch with `PI_INTERCOM_INBOUND_TRIGGER` and `PI_INTERCOM_BUSY_DELIVERY`, or for one session with the new `/intercom-trigger` and `/intercom-busy` commands. A session's choice survives `/resume` and forks. With no argument, each command shows the current value and where it came from.
 
 ### Changed

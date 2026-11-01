@@ -7,6 +7,9 @@
  *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts send --to worker --text "build failed" [--name <bridge-name>] [--json]
  *   npx --yes tsx ~/.pi/agent/npm/node_modules/pi-intercom/cli.ts ask --to worker --text "status?" [--timeout-ms N] [--name <bridge-name>] [--json]
  *
+ * send and ask take an optional --origin <human|agent|extension> --harness <id> pair (both or neither) that
+ * the receiver shows after the sender's cwd. Without it the message carries no origin.
+ *
  * The CLI registers as a regular session, so it shows up in the roster and
  * replies can be routed back to it while it stays connected (`ask`).
  *
@@ -31,10 +34,12 @@ import {
 } from "./cross-machine-envelope.ts";
 import { sendCrossMachine, type CrossMachineDelivery } from "./cross-machine-transport.ts";
 import { parseCrossMachineTarget } from "./cross-machine-discovery.ts";
-import type { CrossMachineProvenance, Message, SessionInfo, SessionRegistration } from "./types.ts";
+import { MESSAGE_ORIGIN_HARNESS_PATTERN, MESSAGE_ORIGIN_KINDS } from "./types.ts";
+import type { CrossMachineProvenance, Message, MessageOrigin, MessageOriginKind, SessionInfo, SessionRegistration } from "./types.ts";
 
 export const CLI_USAGE = `usage: pi-intercom <list|send|ask> [--to <name|session-id>] [--text <message>]
-                        [--timeout-ms <n>] [--name <session-name>] [--json]`;
+                        [--timeout-ms <n>] [--name <session-name>]
+                        [--origin <human|agent|extension> --harness <id>] [--json]`;
 
 export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
@@ -45,6 +50,8 @@ export interface CliOptions {
   envelopeStdin: boolean;
   timeoutMs: number;
   name: string;
+  /** Set only when both --origin and --harness are given. */
+  origin: MessageOrigin | null;
   json: boolean;
 }
 
@@ -58,8 +65,11 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     envelopeStdin: false,
     timeoutMs: DEFAULT_ASK_TIMEOUT_MS,
     name: "pi-intercom-cli",
+    origin: null,
     json: false,
   };
+  let originKind: string | null = null;
+  let originHarness: string | null = null;
 
   const [command, ...rest] = argv;
   if (command !== "list" && command !== "send" && command !== "ask" && command !== "relay") {
@@ -94,6 +104,16 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       opts.text = value;
     } else if (arg === "--name") {
       opts.name = value;
+    } else if (arg === "--origin") {
+      if (!(MESSAGE_ORIGIN_KINDS as readonly string[]).includes(value)) {
+        throw new CliUsageError(`invalid --origin value: ${value} (expected ${MESSAGE_ORIGIN_KINDS.join(", ")})`);
+      }
+      originKind = value;
+    } else if (arg === "--harness") {
+      if (!MESSAGE_ORIGIN_HARNESS_PATTERN.test(value)) {
+        throw new CliUsageError(`invalid --harness value: ${value} (lowercase letters, digits and dashes, at most 32)`);
+      }
+      originHarness = value;
     } else if (arg === "--timeout-ms") {
       const parsed = Number(value);
       if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(parsed) || parsed <= 0) {
@@ -104,6 +124,15 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
       throw new CliUsageError(`unknown option: ${arg}\n${CLI_USAGE}`);
     }
     i++;
+  }
+
+  if ((originKind === null) !== (originHarness === null)) {
+    throw new CliUsageError(`--origin and --harness must be given together\n${CLI_USAGE}`);
+  }
+  if (originKind !== null && originHarness !== null) {
+    if (opts.command !== "send" && opts.command !== "ask") throw new CliUsageError(`--origin is only valid for send and ask\n${CLI_USAGE}`);
+    if (opts.to?.includes("@")) throw new CliUsageError("--origin is not carried by cross-machine delivery");
+    opts.origin = { harness: originHarness, kind: originKind as MessageOriginKind };
   }
 
   if (opts.command === "relay") {
@@ -126,7 +155,7 @@ export interface CliClient {
   sessionId?: string | null;
   connect(session: SessionRegistration, sessionId?: string): Promise<void>;
   listSessions(options?: { timeoutMs?: number }): Promise<SessionInfo[]>;
-  send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string }>;
+  send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance; origin?: MessageOrigin }): Promise<{ id: string; delivered: boolean; reason?: string }>;
   on(event: "message", listener: (from: SessionInfo, message: Message) => void): unknown;
   disconnect(): Promise<void>;
 }
@@ -242,7 +271,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
           return reportFailure(`explicit cross-machine delivery failed: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-      const result = await deps.client.send(opts.to as string, { text: opts.text as string });
+      const result = await deps.client.send(opts.to as string, { text: opts.text as string, ...(opts.origin ? { origin: opts.origin } : {}) });
       if (!result.delivered) {
         return reportFailure(`delivery failed: ${result.reason ?? "unknown reason"}`);
       }
@@ -282,7 +311,7 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
         }
       });
 
-      deps.client.send(opts.to as string, { text: opts.text as string, expectsReply: true }).then(
+      deps.client.send(opts.to as string, { text: opts.text as string, expectsReply: true, ...(opts.origin ? { origin: opts.origin } : {}) }).then(
         (result) => {
           if (!result.delivered) {
             settle({ kind: "delivery-failure", reason: result.reason ?? "unknown reason" });

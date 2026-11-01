@@ -80,8 +80,10 @@ export class ComposeOverlay implements Component {
     this.tui.requestRender();
 
     try {
+      // The overlay sends what the user typed.
       const result = await this.client.send(this.target.id, {
         text: this.inputBuffer.trim(),
+        origin: { harness: "pi", kind: "human" },
       });
       
       if (!result.delivered) {

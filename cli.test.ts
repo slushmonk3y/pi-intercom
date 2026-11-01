@@ -12,7 +12,7 @@ import {
   type CliClient,
 } from "./cli.ts";
 import { parseCrossMachineTarget } from "./cross-machine-discovery.ts";
-import type { CrossMachineProvenance, Message, SessionInfo, SessionRegistration } from "./types.ts";
+import type { CrossMachineProvenance, Message, MessageOrigin, SessionInfo, SessionRegistration } from "./types.ts";
 
 class MemorySink {
   chunks: string[] = [];
@@ -36,7 +36,7 @@ interface FakeClientOptions {
 
 class FakeClient implements CliClient {
   registrations: SessionRegistration[] = [];
-  sends: Array<{ to: string; text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }> = [];
+  sends: Array<{ to: string; text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance; origin?: MessageOrigin }> = [];
   disconnected = false;
   private readonly options: FakeClientOptions;
   private listeners: Array<(from: SessionInfo, message: Message) => void> = [];
@@ -55,8 +55,8 @@ class FakeClient implements CliClient {
     return this.options.sessions ?? [];
   }
 
-  async send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string }> {
-    this.sends.push({ to, text: options.text, expectsReply: options.expectsReply, ...(options.crossMachine ? { crossMachine: options.crossMachine } : {}) });
+  async send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance; origin?: MessageOrigin }): Promise<{ id: string; delivered: boolean; reason?: string }> {
+    this.sends.push({ to, text: options.text, expectsReply: options.expectsReply, ...(options.crossMachine ? { crossMachine: options.crossMachine } : {}), ...(options.origin ? { origin: options.origin } : {}) });
     if (this.options.sendError) {
       throw this.options.sendError;
     }
@@ -301,6 +301,31 @@ test("runCli relay cannot recurse to a remote address", async () => {
   assert.equal(code, 1);
   assert.equal(client.registrations.length, 0);
   assert.equal(client.sends.length, 0);
+});
+
+test("parseCliArgs takes --origin and --harness together for send and ask", () => {
+  assert.equal(parseCliArgs(["send", "--to", "w", "--text", "hi"]).origin, null);
+  assert.deepEqual(parseCliArgs(["send", "--to", "w", "--text", "hi", "--origin", "human", "--harness", "claude-code"]).origin, { harness: "claude-code", kind: "human" });
+  assert.deepEqual(parseCliArgs(["ask", "--to", "w", "--text", "?", "--harness", "pi", "--origin", "agent"]).origin, { harness: "pi", kind: "agent" });
+  assert.throws(() => parseCliArgs(["send", "--to", "w", "--text", "hi", "--origin", "human"]), /must be given together/);
+  assert.throws(() => parseCliArgs(["send", "--to", "w", "--text", "hi", "--harness", "pi"]), /must be given together/);
+  assert.throws(() => parseCliArgs(["send", "--to", "w", "--text", "hi", "--origin", "robot", "--harness", "pi"]), /invalid --origin/);
+  for (const harness of ["Pi", "-pi", "pi_x", "a".repeat(33), ""]) {
+    assert.throws(() => parseCliArgs(["send", "--to", "w", "--text", "hi", "--origin", "human", "--harness", harness]), /invalid --harness|missing value/, harness);
+  }
+  assert.throws(() => parseCliArgs(["list", "--origin", "human", "--harness", "pi"]), /only valid for send and ask/);
+  assert.throws(() => parseCliArgs(["send", "--to", "w@laptop", "--text", "hi", "--origin", "human", "--harness", "pi"]), /not carried by cross-machine/);
+});
+
+test("runCli send and ask carry a flagged origin and omit an unflagged one", async () => {
+  const client = new FakeClient();
+  assert.equal(await runCli(["send", "--to", "worker", "--text", "plain"], { client, out: new MemorySink(), err: new MemorySink() }), 0);
+  assert.equal(await runCli(["send", "--to", "worker", "--text", "mine", "--origin", "human", "--harness", "claude-code"], { client, out: new MemorySink(), err: new MemorySink() }), 0);
+  assert.equal("origin" in client.sends[0]!, false);
+  assert.deepEqual(client.sends[1]?.origin, { harness: "claude-code", kind: "human" });
+  const asker = new FakeClient({ replyOnSend: { from: sessionFixture(), text: "ok" } });
+  assert.equal(await runCli(["ask", "--to", "worker", "--text", "?", "--origin", "agent", "--harness", "pi"], { client: asker, out: new MemorySink(), err: new MemorySink() }), 0);
+  assert.deepEqual(asker.sends[0]?.origin, { harness: "pi", kind: "agent" });
 });
 
 test("runCli ask prints the reply", async () => {

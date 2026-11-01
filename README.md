@@ -149,6 +149,24 @@ In fullscreen mode, a plain left-click anywhere on an intercom message expands o
 
 Ctrl+O still expands or collapses every message and clears per-message choices. Those choices are not saved: reloading, resuming, or forking a session, or anything that rebuilds the whole transcript, returns each message to the Ctrl+O state.
 
+### Message origin
+
+A message can say who wrote it and in which harness. The receiver shows that after the sender's directory, in the text the model reads and in the inline header:
+
+```
+**From research** (~/projects/api) · human via claude-code
+```
+
+The kinds are `human` (a person typed it), `agent` (a model's tool call wrote it) and `extension` (code sent it on its own). Pi marks its own sends:
+
+| Pi send | Origin |
+|---|---|
+| `intercom` tool `send`, `ask`, `reply`, `handover`; `contact_supervisor`; a subagent message relayed to another session | `agent via pi` |
+| the `/intercom` overlay; the `/handover` command and picker | `human via pi` |
+| extension outbox; the automatic reply of a busy non-interactive session | `extension via pi` |
+
+A message with no origin (an older client, the CLI without `--origin`, a cross-machine relay) shows the header exactly as before, with no marker. The origin is the sender's own claim: the broker passes it through without checking it, like the sender's name, so treat it as a label, not proof. Nothing in pi-intercom grants or refuses anything by origin.
+
 ## Workflow: Planner-Worker Coordination
 
 The most natural use of pi-intercom is splitting a task between two sessions — one holds the big picture, the other does the hands-on work. When the worker hits an ambiguity ("should I optimize for readability or performance here?"), they ask without losing context.
@@ -621,9 +639,14 @@ pi-intercom ask --to planner --text "which API version?" --timeout-ms 180000
 
 # JSON output for scripts
 pi-intercom list --json
+
+# say who wrote it: the receiver shows "· human via claude-code"
+pi-intercom send --to boss --text "ship it" --origin human --harness claude-code
 ```
 
-Flags: `--to <name|session-id>`, `--text`, `--name <session-name>` (roster name, default `pi-intercom-cli`), `--timeout-ms` (ask only, default 120000), `--json`. Exit codes: `0` success, `1` usage/connection/delivery failure, `2` ask timeout. With `--json`, every command prints one object with an `ok` field: `list` returns `{ ok: true, sessions: [...] }`, and failures return `ok: false` with `error` (plus `reason: "timeout"` on timeout).
+The CLI cannot tell whether a person or an agent's shell call ran it, so without `--origin` it sends no origin and the receiver shows the plain header. Pass `--origin human --harness <id>` when you send by hand and want it marked as yours. Origin is not carried by cross-machine (`--to name@machine`) delivery.
+
+Flags: `--to <name|session-id>`, `--text`, `--name <session-name>` (roster name, default `pi-intercom-cli`), `--timeout-ms` (ask only, default 120000), `--origin <human|agent|extension>` with `--harness <id>` (send and ask only, both or neither; see [Message origin](#message-origin)), `--json`. Exit codes: `0` success, `1` usage/connection/delivery failure, `2` ask timeout. With `--json`, every command prints one object with an `ok` field: `list` returns `{ ok: true, sessions: [...] }`, and failures return `ok: false` with `error` (plus `reason: "timeout"` on timeout).
 
 ### Cross-machine coordination over ssh
 

@@ -24,7 +24,7 @@ import {
   type IntercomConfig,
 } from "./config.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
-import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
+import type { Attachment, BrokerMessage, Message, MessageControl, MessageOrigin, MessageOriginKind, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
   INTERCOM_EXTENSION_REGISTER_EVENT,
   INTERCOM_EXTENSION_REGISTRY_READY_EVENT,
@@ -158,6 +158,13 @@ interface DeliveryRequest {
   retryOf?: string;
   /** Handovers are always new messages and are not sent once the signal aborts. */
   handover?: boolean;
+  /** Who wrote the message: the model's tool call (`agent`) or the user's `/handover` (`human`). */
+  origin: MessageOrigin;
+}
+
+/** The `origin` Pi stamps on messages it sends. */
+function piOrigin(kind: MessageOriginKind): MessageOrigin {
+  return { harness: "pi", kind };
 }
 
 interface IntercomToolResult {
@@ -723,6 +730,10 @@ function firstTextContent(result: { content?: Array<{ type: string; text?: strin
 }
 function formatMessageTimestamp(timestamp: number | undefined): string | undefined {
   return typeof timestamp === "number" && Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : undefined;
+}
+/** ` · human via claude-code` after the header's cwd; empty for a message that names no origin. */
+function formatOriginSuffix(message: Message): string {
+  return message.origin ? ` · ${message.origin.kind} via ${message.origin.harness}` : "";
 }
 function formatInboundDeliveryMetadata(message: Message): string {
   const parts = [`id ${message.id}`];
@@ -1501,6 +1512,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         const result = await activeClient.send(target.id, {
           messageId: request.requestId,
           text: request.message,
+          origin: piOrigin("extension"),
           provenance: {
             type: "extension_outbox",
             extensionId: request.extensionId,
@@ -1581,7 +1593,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
     pi.sendMessage(
       {
         customType: "intercom_message",
-        content: `**From ${senderDisplay}** (${entry.from.cwd})${replyInstruction}\n\n_${deliveryMetadata}_\n\n${entry.bodyText}`,
+        content: `**From ${senderDisplay}** (${entry.from.cwd})${formatOriginSuffix(injectedMessage)}${replyInstruction}\n\n_${deliveryMetadata}_\n\n${entry.bodyText}`,
         display: true,
         details: deliveredEntry,
       },
@@ -1610,6 +1622,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
               const result = await activeClient.send(entry.from.id, {
                 text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
                 replyTo: entry.message.id,
+                origin: piOrigin("extension"),
               });
               if (result.delivered && getLiveContext(ctx, generation)) dismissIncomingAsk(entry.message.id);
             } catch {
@@ -2232,6 +2245,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
         replyTo: effectiveReplyTo,
         supersedes,
         retryOf,
+        origin: request.origin,
       }));
       if (!result.delivered) {
         return {
@@ -2429,7 +2443,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
       }
 
       try {
-        const { result } = await sendWithNamePrefixFallback(activeClient, { rawTo: parsed.to, firstTarget: target, display: parsed.to }, (attemptTo) => activeClient.send(attemptTo, { text: parsed.message }));
+        const { result } = await sendWithNamePrefixFallback(activeClient, { rawTo: parsed.to, firstTarget: target, display: parsed.to }, (attemptTo) => activeClient.send(attemptTo, { text: parsed.message, origin: piOrigin("agent") }));
         if (!relayStillLive()) return;
         if (!result.delivered) {
           const error = new Error(result.reason ?? "Session may not exist or has disconnected.");
@@ -2742,6 +2756,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           try {
             const sent = await sendWithNamePrefixFallback(connectedClient, supervisorTarget, (attemptTo) => connectedClient.send(attemptTo, {
               text: formatChildOrchestratorMessage("update", metadata, message),
+              origin: piOrigin("agent"),
             }));
             const { result } = sent;
             if (!result.delivered) {
@@ -2788,7 +2803,7 @@ export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSIO
           const requestText = reason === "interview_request"
             ? formatChildOrchestratorMessage("interview", metadata, formatSupervisorInterviewRequest(supervisorInterview!, typeof params.message === "string" ? params.message : undefined))
             : formatChildOrchestratorMessage("ask", metadata, params.message as string);
-          const sent = await askWithNamePrefixFallback(connectedClient, supervisorTarget, { text: requestText }, {
+          const sent = await askWithNamePrefixFallback(connectedClient, supervisorTarget, { text: requestText, origin: piOrigin("agent") }, {
             signal,
             onAttempt: (askId) => { questionId = askId; },
             deliveryState: () => latestDeliveryState(questionId, deliveryState),
@@ -3082,7 +3097,7 @@ Usage:
             };
           }
           return deliverMessage(connectedClient, ctx, _signal, {
-            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf,
+            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, origin: piOrigin("agent"),
           });
         }
 
@@ -3115,7 +3130,7 @@ Usage:
               details: { error: true },
             };
           }
-          return deliverMessage(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true });
+          return deliverMessage(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true, origin: piOrigin("agent") });
         }
 
         case "ask": {
@@ -3175,7 +3190,7 @@ Usage:
                 details: { error: true },
               };
             }
-            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, { text: message, attachments, replyTo, supersedes, retryOf }, {
+            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, { text: message, attachments, replyTo, supersedes, retryOf, origin: piOrigin("agent") }, {
               signal: _signal,
               onAttempt: (askId) => { questionId = askId; },
               deliveryState: () => latestDeliveryState(questionId, deliveryState),
@@ -3244,6 +3259,7 @@ Usage:
               text: message,
               attachments,
               replyTo: target.message.id,
+              origin: piOrigin("agent"),
             });
             if (!result.delivered) {
               if (result.reason === "Session not found") {
@@ -3628,7 +3644,8 @@ Usage:
       notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", generation);
       return;
     }
-    const result = await deliverMessage(handoverClient, ctx, undefined, { ...request, message: edited, handover: true });
+    // performHandover serves only the user's /handover command and overlay; the tool's handover calls deliverMessage itself.
+    const result = await deliverMessage(handoverClient, ctx, undefined, { ...request, message: edited, handover: true, origin: piOrigin("human") });
     const failed = result.details.error === true || result.details.delivered === false;
     notifyIfLive(ctx, failed ? firstTextContent(result) : `Handover: ${firstTextContent(result)}`, failed ? "error" : "info", generation);
   }

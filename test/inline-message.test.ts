@@ -94,6 +94,11 @@ test("local message header and reply affordance remain unchanged", () => {
   assert.doesNotMatch(rendered, /unverified cross-machine|To send a new message to/);
 });
 
+test("an origin shows after the sender's cwd in the inline header", () => {
+  const component = new InlineMessageComponent(from, { ...message, origin: { harness: "claude-code", kind: "human" } }, theme as any, "intercom reply");
+  assert.match(component.render(100).join("\n"), /From: sender \(\/tmp\/project\) · human via claude-code /);
+});
+
 test("collapsed inline intercom messages keep preview, reply hint, and expand key visible", () => {
   const component = new InlineMessageComponent(
     from,

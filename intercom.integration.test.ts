@@ -1956,6 +1956,7 @@ test("intercom handover summarizes the session and delivers it to the target", {
     const [, message] = await received;
     assert.match(message.content.text, /^# Handover from handover-sender\n/);
     assert.equal(message.replyTo, undefined);
+    assert.deepEqual(message.origin, { harness: "pi", kind: "agent" });
     assert.match(message.content.text, /Sender session file: \/sessions\/handover-sender\.jsonl/);
     assert.ok(message.content.text.endsWith("## Next task\nPort the fix"));
     assert.match(modelRequests[0]!.messages[0]!.content[0]!.text, /fix the adapter[\s\S]*continue in pi-mcp-adapter/);
@@ -2311,6 +2312,7 @@ test("extension outbox sends notify-only messages with trace and provenance", { 
     ]);
     assert.equal(message.id, "outbox-success-1");
     assert.equal(message.content.text, "Outbox hello.");
+    assert.deepEqual(message.origin, { harness: "pi", kind: "extension" });
     assert.deepEqual(message.provenance, {
       type: "extension_outbox",
       extensionId: "example-extension",
@@ -3479,6 +3481,7 @@ test("busy non-interactive sessions auto-reply to top-level asks without abortin
     const reply = await replyPromise;
     assert.equal(reply.message.replyTo, askId);
     assert.match(reply.message.content.text, /non-interactive|cannot respond/i);
+    assert.deepEqual(reply.message.origin, { harness: "pi", kind: "extension" });
     assert.equal(abortCount, 0);
 
   } finally {
@@ -4874,6 +4877,8 @@ test("intercom reply queues mail for a disconnected named sender", { concurrency
     const [, message] = await queuedReply;
     assert.equal(message.replyTo, "stale-reply-ask");
     assert.equal(message.content.text, "No sender remains.");
+    // The origin survives the broker mailbox.
+    assert.deepEqual(message.origin, { harness: "pi", kind: "agent" });
   } finally {
     await replacement.disconnect().catch(() => undefined);
     await harness.emitLifecycle("session_shutdown");
@@ -5917,6 +5922,90 @@ test("policy registration is idempotent for the same object, single-owner, and r
     assert.equal(handle.active, false, "a policy starts inactive");
   } finally {
     await harness.emitLifecycle("session_shutdown").catch(() => undefined);
+    await cleanup();
+  }
+});
+
+test("intercom tool send and ask, and a subagent relay to a peer, carry pi agent origin", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("origin-agent");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(planner, "origin-agent");
+    const intercomTool = harness.tools.find((tool) => tool.name === "intercom")!;
+
+    const sent = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const sendResult = await intercomTool.execute("origin-send", { action: "send", to: "planner", message: "tool send" }, new AbortController().signal, undefined, harness.ctx);
+    assert.equal(sendResult.details?.delivered, true);
+    assert.deepEqual((await sent)[1].origin, { harness: "pi", kind: "agent" });
+
+    const asked = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    const askResult = intercomTool.execute("origin-ask", { action: "ask", to: "planner", message: "tool ask" }, new AbortController().signal, undefined, harness.ctx);
+    const [, question] = await asked;
+    assert.equal(question.expectsReply, true);
+    assert.deepEqual(question.origin, { harness: "pi", kind: "agent" });
+    await planner.send((await waitForSessionByName(planner, "origin-agent")).id, { text: "answer", replyTo: question.id });
+    await askResult;
+
+    const relayed = once(planner, "message") as Promise<[SessionInfo, Message]>;
+    harness.pi.events.emit("subagent:control-intercom", { to: "planner", message: "subagent needs attention" });
+    const [, relay] = await relayed;
+    assert.match(relay.content.text, /subagent needs attention/);
+    assert.deepEqual(relay.origin, { harness: "pi", kind: "agent" });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("the /handover command carries pi human origin", { concurrency: false }, async () => {
+  const { orchestrator, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("origin-handover", {
+    hasUI: true,
+    ui: {
+      custom: async () => ({ text: "# Handover\nkeep going" }),
+      editor: async (_title: string, text: string) => text,
+      notify: () => undefined,
+    },
+  });
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    await waitForSessionByName(orchestrator, "origin-handover");
+    const received = once(orchestrator, "message") as Promise<[SessionInfo, Message]>;
+    await harness.commands.get("handover")!("orchestrator keep going", harness.ctx);
+    const [, message] = await received;
+    assert.equal(message.content.text, "# Handover\nkeep going");
+    assert.deepEqual(message.origin, { harness: "pi", kind: "human" });
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
+    await cleanup();
+  }
+});
+
+test("the posted header shows a peer's origin after the cwd and nothing for an unmarked message", { concurrency: false }, async () => {
+  const { planner, cleanup } = await setupClients();
+  const { default: piIntercomExtension } = await import("./index.ts");
+  const harness = createExtensionHarness("origin-receiver");
+  try {
+    piIntercomExtension(harness.pi as never);
+    await harness.emitLifecycle("session_start");
+    const receiver = await waitForSessionByName(planner, "origin-receiver");
+
+    assert.equal((await planner.send(receiver.id, { text: "marked", origin: { harness: "claude-code", kind: "human" } })).delivered, true);
+    await waitForCondition(() => harness.sentMessages.length === 1, "marked message posted");
+    assert.equal((await planner.send(receiver.id, { text: "unmarked" })).delivered, true);
+    await waitForCondition(() => harness.sentMessages.length === 2, "unmarked message posted");
+
+    const [marked, unmarked] = harness.sentMessages.map((sent) => sent.message.content ?? "");
+    assert.match(marked!, new RegExp(`^\\*\\*From planner\\*\\* \\(${repoDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\) · human via claude-code\n`));
+    assert.match(unmarked!, /^\*\*From planner\*\* \([^)]*\)\n/);
+    assert.doesNotMatch(unmarked!, / via /);
+  } finally {
+    await harness.emitLifecycle("session_shutdown");
     await cleanup();
   }
 });

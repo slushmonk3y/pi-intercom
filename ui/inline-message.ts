@@ -58,7 +58,8 @@ export class InlineMessageComponent implements Component {
     }
     const bodyWidth = Math.max(1, width - 2);
 
-    const header = ` From: ${senderName} (${this.from.cwd}) `;
+    const origin = this.message.origin ? ` · ${this.message.origin.kind} via ${this.message.origin.harness}` : "";
+    const header = ` From: ${senderName} (${this.from.cwd})${origin} `;
     const headerText = truncateToWidth(collapsed ? `${header} Ctrl+O expands ` : header, bodyWidth, "");
     const headerPadding = Math.max(0, bodyWidth - visibleWidth(headerText));
     lines.push(

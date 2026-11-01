@@ -57,6 +57,25 @@ test("compose overlay renders lines at the declared overlay width", () => {
   }
 });
 
+test("compose overlay sends what the user typed with pi human origin", async () => {
+  const sends: Array<{ to: string; options: Record<string, unknown> }> = [];
+  let finished: unknown;
+  const overlay = new ComposeOverlay(
+    { requestRender() {} } as any,
+    theme as any,
+    { matches: (data: string, id: string) => id === "tui.select.confirm" && data === "\r" } as any,
+    session,
+    "subagent-chat-019ecaf6",
+    { send: async (to: string, options: Record<string, unknown>) => { sends.push({ to, options }); return { delivered: true, id: "message-1", delivery: "socket_delivered" }; } } as any,
+    (result) => { finished = result; },
+  );
+  overlay.handleInput("hi there");
+  overlay.handleInput("\r");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(sends, [{ to: "session-12345678", options: { text: "hi there", origin: { harness: "pi", kind: "human" } } }]);
+  assert.deepEqual(finished, { sent: true, messageId: "message-1", text: "hi there", queued: false });
+});
+
 test("session list overlay renders lines at the declared overlay width", () => {
   const overlay = new SessionListOverlay(theme as any, keybindings as any, session, [session], () => {});
 

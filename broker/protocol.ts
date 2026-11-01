@@ -1,7 +1,9 @@
+import { MESSAGE_ORIGIN_HARNESS_PATTERN, MESSAGE_ORIGIN_KINDS } from "../types.ts";
 import type {
   Attachment,
   Message,
   MessageControl,
+  MessageOrigin,
   MessageProvenance,
   MessageReceipt,
   MessageReceiptStatus,
@@ -101,6 +103,13 @@ function isMessageProvenance(value: unknown): value is MessageProvenance {
     && typeof value.requestId === "string";
 }
 
+export function isMessageOrigin(value: unknown): value is MessageOrigin {
+  return isRecord(value)
+    && typeof value.harness === "string"
+    && MESSAGE_ORIGIN_HARNESS_PATTERN.test(value.harness)
+    && (MESSAGE_ORIGIN_KINDS as readonly unknown[]).includes(value.kind);
+}
+
 function isCrossMachineProvenance(value: unknown): boolean {
   if (
     !isRecord(value)
@@ -151,6 +160,9 @@ export function isMessage(value: unknown): value is Message {
   if (value.crossMachine !== undefined && !isCrossMachineProvenance(value.crossMachine)) {
     return false;
   }
+  if (value.origin !== undefined && !isMessageOrigin(value.origin)) {
+    return false;
+  }
 
   if (!isRecord(value.content) || typeof value.content.text !== "string") {
     return false;
@@ -172,6 +184,7 @@ export function messageDeliveryFingerprint(message: Message, targetId: string): 
     retryOf: message.retryOf,
     provenance: message.provenance,
     crossMachine: message.crossMachine,
+    origin: message.origin,
   });
 }
 

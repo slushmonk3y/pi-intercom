@@ -97,10 +97,26 @@ export interface Message {
   expectsReply?: boolean;
   provenance?: MessageProvenance;
   crossMachine?: CrossMachineProvenance;
+  /** Self-asserted sending harness and author kind, for display only; absent when the sender does not say. */
+  origin?: MessageOrigin;
   content: {
     text: string;
     attachments?: Attachment[];
   };
+}
+
+export const MESSAGE_ORIGIN_KINDS = ["human", "agent", "extension"] as const;
+export type MessageOriginKind = typeof MESSAGE_ORIGIN_KINDS[number];
+/** Lowercase harness id such as `pi`, `opencode` or `claude-code`. */
+export const MESSAGE_ORIGIN_HARNESS_PATTERN = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
+/**
+ * Who wrote a message: a person (`human`), a model's tool call (`agent`), or code acting on its own (`extension`),
+ * in which harness. Set by the sender and not verified by the broker; a display label, never authority.
+ */
+export interface MessageOrigin {
+  harness: string;
+  kind: MessageOriginKind;
 }
 
 export interface MessageProvenance {
